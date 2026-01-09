@@ -17,6 +17,7 @@ class ChatRequest(BaseModel):
     tenant_id: str
     message: str
 
+
 class ChatResponse(BaseModel):
     request_id: str
     status: str
@@ -49,7 +50,6 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
         # 2. Publish event to Kafka
         # 3. Return async acknowledgement
 
-        # Emit an audit log to correlate the async workflow with request metadata.
         logger.info(
             "Accepted chat request",
             extra={"tenant_id": req.tenant_id, "request_id": request_id},
@@ -57,7 +57,7 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
 
         return ChatResponse(
             request_id=request_id,
-            status="accepted"
+            status="accepted",
         )
     finally:
         REQUEST_COUNT.labels(service="api-gateway").inc()
