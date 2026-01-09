@@ -7,14 +7,47 @@ RETRY_BACKOFF_SECONDS = 2
 
 logger = logging.getLogger(__name__)
 
+
+def retrieve_context(message: str, tenant_id: str) -> list[dict]:
+    """
+    Fetch context from the RAG service (placeholder).
+    """
+    logger.info(
+        "Retrieving context",
+        extra={"tenant_id": tenant_id, "message_length": len(message or "")},
+    )
+    return []
+
+
+def generate_response(message: str, context: list[dict]) -> dict:
+    """
+    Invoke the LLM orchestrator (placeholder).
+    """
+    logger.info("Invoking LLM", extra={"context_size": len(context)})
+    return {"provider": "openai", "response": "placeholder"}
+
 def process_message(event: dict):
     """
     Core async workflow processor.
     """
+    tenant_id = event.get("tenant_id")
+    message = event.get("message")
+    logger.info("Processing event", extra={"request_id": event.get("request_id")})
+
     # 1. Enrich with RAG
+    retrieved = retrieve_context(message, tenant_id)
+
     # 2. Invoke LLM
-    # 3. Persist result
-    logger.info(f"Processing event: {event}")
+    response = generate_response(message, retrieved)
+
+    # 3. Persist result (placeholder)
+    logger.info(
+        "Generated response",
+        extra={
+            "request_id": event.get("request_id"),
+            "provider": response.get("provider"),
+        },
+    )
 
 
 def handle_event(event: dict):
