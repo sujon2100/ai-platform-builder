@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, validator
 from time import perf_counter
+from datetime import datetime, timezone
 import uuid
 import os
 import logging
@@ -11,6 +12,7 @@ app = FastAPI(title="AI Platform API Gateway")
 logger = logging.getLogger(__name__)
 
 API_KEY_ENV_VAR = "AI_PLATFORM_API_KEY"
+DEFAULT_KAFKA_TOPIC = "ai-chat-requests"
 
 
 class ChatRequest(BaseModel):
@@ -28,6 +30,23 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     request_id: str
     status: str
+
+
+def build_chat_event(req: ChatRequest, request_id: str) -> dict:
+    """Construct the outbound event for downstream workflow processing."""
+    return {
+        "request_id": request_id,
+        "tenant_id": req.tenant_id,
+        "message": req.message,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "event_type": "chat.requested",
+    }
+
+
+def publish_event(event: dict, topic: str = DEFAULT_KAFKA_TOPIC) -> None:
+    """Publish the event to Kafka (placeholder implementation)."""
+    # TODO: replace with Kafka producer publish.
+    logger.info("Published chat event", extra={"topic": topic, "event": event})
 
 
 def verify_api_key(x_api_key: str | None) -> None:
@@ -56,6 +75,9 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
         # 1. Authenticate request
         # 2. Publish event to Kafka
         # 3. Return async acknowledgement
+
+        event = build_chat_event(req, request_id)
+        publish_event(event)
 
         # Emit an audit log to correlate the async workflow with request metadata.
         logger.info(
