@@ -45,7 +45,7 @@ def build_chat_event(req: ChatRequest, request_id: str) -> dict:
 def publish_event(event: dict, topic: str = DEFAULT_KAFKA_TOPIC) -> None:
     """Publish the event to Kafka (placeholder implementation)."""
     # TODO: replace with Kafka producer publish.
-    logger.info("Published chat event", extra={"topic": topic, **event})
+    logger.info("Published chat event", extra={"topic": topic, "event": event})
 
 
 def verify_api_key(x_api_key: str | None) -> None:
