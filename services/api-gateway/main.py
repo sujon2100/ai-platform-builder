@@ -24,6 +24,7 @@ class ChatRequest(BaseModel):
             raise ValueError("must not be empty")
         return value
 
+
 class ChatResponse(BaseModel):
     request_id: str
     status: str
@@ -64,7 +65,7 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
 
         return ChatResponse(
             request_id=request_id,
-            status="accepted"
+            status="accepted",
         )
     finally:
         REQUEST_COUNT.labels(service="api-gateway").inc()
