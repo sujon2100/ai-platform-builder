@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from time import perf_counter
 import uuid
 import os
@@ -16,6 +16,13 @@ API_KEY_ENV_VAR = "AI_PLATFORM_API_KEY"
 class ChatRequest(BaseModel):
     tenant_id: str
     message: str
+
+    @validator("tenant_id", "message")
+    def non_empty(cls, value: str) -> str:
+        """Reject empty or whitespace-only fields before enqueueing work."""
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
 
 
 class ChatResponse(BaseModel):
@@ -50,6 +57,7 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
         # 2. Publish event to Kafka
         # 3. Return async acknowledgement
 
+        # Emit an audit log to correlate the async workflow with request metadata.
         logger.info(
             "Accepted chat request",
             extra={"tenant_id": req.tenant_id, "request_id": request_id},
