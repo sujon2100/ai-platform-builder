@@ -1,6 +1,9 @@
 import time
 import json
 import logging
+from time import perf_counter
+
+from services.observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
@@ -26,28 +29,40 @@ def generate_response(message: str, context: list[dict]) -> dict:
     logger.info("Invoking LLM", extra={"context_size": len(context)})
     return {"provider": "openai", "response": "placeholder"}
 
+
 def process_message(event: dict):
     """
     Core async workflow processor.
     """
     tenant_id = event.get("tenant_id")
     message = event.get("message")
-    logger.info("Processing event", extra={"request_id": event.get("request_id")})
 
-    # 1. Enrich with RAG
-    retrieved = retrieve_context(message, tenant_id)
-
-    # 2. Invoke LLM
-    response = generate_response(message, retrieved)
-
-    # 3. Persist result (placeholder)
     logger.info(
-        "Generated response",
-        extra={
-            "request_id": event.get("request_id"),
-            "provider": response.get("provider"),
-        },
+        "Processing event",
+        extra={"request_id": event.get("request_id")},
     )
+
+    start_time = perf_counter()
+    try:
+        # 1. Enrich with RAG
+        retrieved = retrieve_context(message, tenant_id)
+
+        # 2. Invoke LLM
+        response = generate_response(message, retrieved)
+
+        # 3. Persist result (placeholder)
+        logger.info(
+            "Generated response",
+            extra={
+                "request_id": event.get("request_id"),
+                "provider": response.get("provider"),
+            },
+        )
+    finally:
+        REQUEST_COUNT.labels(service="workflow-engine").inc()
+        REQUEST_LATENCY.labels(service="workflow-engine").observe(
+            perf_counter() - start_time
+        )
 
 
 def handle_event(event: dict):
