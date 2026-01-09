@@ -37,6 +37,9 @@ def process_message(event: dict):
     tenant_id = event.get("tenant_id")
     message = event.get("message")
 
+    if not tenant_id or not message:
+        raise ValueError("event must include tenant_id and message")
+
     logger.info(
         "Processing event",
         extra={"request_id": event.get("request_id")},
