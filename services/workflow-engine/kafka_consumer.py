@@ -29,13 +29,18 @@ def generate_response(message: str, context: list[dict]) -> dict:
     logger.info("Invoking LLM", extra={"context_size": len(context)})
     return {"provider": "openai", "response": "placeholder"}
 
+
 def process_message(event: dict):
     """
     Core async workflow processor.
     """
     tenant_id = event.get("tenant_id")
     message = event.get("message")
-    logger.info("Processing event", extra={"request_id": event.get("request_id")})
+
+    logger.info(
+        "Processing event",
+        extra={"request_id": event.get("request_id")},
+    )
 
     start_time = perf_counter()
     try:
