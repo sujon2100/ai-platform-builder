@@ -58,8 +58,8 @@ def process_message(event: dict):
         # 2. Invoke LLM
         response = generate_response(message, retrieved)
 
-    # 3. Persist result (placeholder)
-    persist_result(event.get("request_id"), response)
+        # 3. Persist result (placeholder)
+        persist_result(event.get("request_id"), response)
     finally:
         REQUEST_COUNT.labels(service="workflow-engine").inc()
         REQUEST_LATENCY.labels(service="workflow-engine").observe(
