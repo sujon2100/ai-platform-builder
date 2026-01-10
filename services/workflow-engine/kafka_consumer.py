@@ -7,6 +7,7 @@ from services.observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
+MAX_BACKOFF_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -39,24 +40,19 @@ def persist_result(request_id: str | None, response: dict) -> None:
         extra={"request_id": request_id, "provider": response.get("provider")},
     )
 
-
+    
 def process_message(event: dict):
     """
     Core async workflow processor.
     """
+    tenant_id = event.get("tenant_id")
+    message = event.get("message")
+    if not tenant_id or not message:
+        raise ValueError("event must include tenant_id and message")
+    logger.info("Processing event", extra={"request_id": event.get("request_id")})
+
     start_time = perf_counter()
     try:
-        tenant_id = event.get("tenant_id")
-        message = event.get("message")
-
-        if not tenant_id or not message:
-            raise ValueError("event must include tenant_id and message")
-
-        logger.info(
-            "Processing event",
-            extra={"request_id": event.get("request_id")},
-        )
-
         # 1. Enrich with RAG
         retrieved = retrieve_context(message, tenant_id)
 
@@ -65,7 +61,6 @@ def process_message(event: dict):
 
         # 3. Persist result (placeholder)
         persist_result(event.get("request_id"), response)
-
     finally:
         REQUEST_COUNT.labels(service="workflow-engine").inc()
         REQUEST_LATENCY.labels(service="workflow-engine").observe(
@@ -85,7 +80,7 @@ def handle_event(event: dict):
 
         if retries < MAX_RETRIES:
             event["retries"] = retries + 1
-            time.sleep(RETRY_BACKOFF_SECONDS ** retries)
+            time.sleep(calculate_backoff(retries))
 
             logger.info(f"Retrying event, attempt {event['retries']}")
             handle_event(event)
@@ -99,3 +94,10 @@ def send_to_dlq(event: dict):
     """
     logger.critical(f"Sending event to DLQ: {json.dumps(event)}")
     # In production: publish to Kafka DLQ topic
+
+
+def calculate_backoff(retries: int) -> int:
+    """
+    Calculate exponential backoff for retry attempts with a hard cap.
+    """
+    return min(MAX_BACKOFF_SECONDS, RETRY_BACKOFF_SECONDS ** retries)
