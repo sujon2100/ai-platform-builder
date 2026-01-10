@@ -40,7 +40,6 @@ def persist_result(request_id: str | None, response: dict) -> None:
         extra={"request_id": request_id, "provider": response.get("provider")},
     )
 
-    
 def process_message(event: dict):
     """
     Core async workflow processor.
@@ -76,13 +75,24 @@ def handle_event(event: dict):
         logger.info("Event processed successfully")
 
     except Exception as e:
-        logger.error(f"Processing failed: {e}")
+        logger.error(
+            "Processing failed",
+            extra={"request_id": event.get("request_id")},
+            exc_info=True,
+        )
 
         if retries < MAX_RETRIES:
             event["retries"] = retries + 1
             time.sleep(calculate_backoff(retries))
 
-            logger.info(f"Retrying event, attempt {event['retries']}")
+            logger.info(
+                "Retrying event",
+                extra={
+                    "request_id": event.get("request_id"),
+                    "attempt": event["retries"],
+                    "backoff_seconds": calculate_backoff(retries),
+                },
+            )
             handle_event(event)
         else:
             send_to_dlq(event)
