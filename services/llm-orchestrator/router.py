@@ -1,3 +1,10 @@
+import logging
+
+from services.observability.metrics import LLM_ERRORS
+
+
+logger = logging.getLogger(__name__)
+
 class LLMRouter:
     def __init__(self):
         self.providers = ["openai", "ollama"]
@@ -13,7 +20,12 @@ class LLMRouter:
 
     def generate(self, prompt: str, context: dict):
         provider = self.select_provider(context)
-        return {
-            "provider": provider,
-            "response": f"Generated response from {provider}"
-        }
+        try:
+            return {
+                "provider": provider,
+                "response": f"Generated response from {provider}",
+            }
+        except Exception:
+            logger.exception("LLM generation failed", extra={"provider": provider})
+            LLM_ERRORS.labels(provider=provider).inc()
+            raise

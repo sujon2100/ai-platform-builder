@@ -3,7 +3,7 @@ import json
 import logging
 from time import perf_counter
 
-from observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
+from services.observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
