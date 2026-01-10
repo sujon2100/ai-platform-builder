@@ -30,23 +30,33 @@ def generate_response(message: str, context: list[dict]) -> dict:
     return {"provider": "openai", "response": "placeholder"}
 
 
+def persist_result(request_id: str | None, response: dict) -> None:
+    """
+    Persist LLM response output (placeholder).
+    """
+    logger.info(
+        "Persisting result",
+        extra={"request_id": request_id, "provider": response.get("provider")},
+    )
+
+
 def process_message(event: dict):
     """
     Core async workflow processor.
     """
-    tenant_id = event.get("tenant_id")
-    message = event.get("message")
-
-    if not tenant_id or not message:
-        raise ValueError("event must include tenant_id and message")
-
-    logger.info(
-        "Processing event",
-        extra={"request_id": event.get("request_id")},
-    )
-
     start_time = perf_counter()
     try:
+        tenant_id = event.get("tenant_id")
+        message = event.get("message")
+
+        if not tenant_id or not message:
+            raise ValueError("event must include tenant_id and message")
+
+        logger.info(
+            "Processing event",
+            extra={"request_id": event.get("request_id")},
+        )
+
         # 1. Enrich with RAG
         retrieved = retrieve_context(message, tenant_id)
 
@@ -54,13 +64,8 @@ def process_message(event: dict):
         response = generate_response(message, retrieved)
 
         # 3. Persist result (placeholder)
-        logger.info(
-            "Generated response",
-            extra={
-                "request_id": event.get("request_id"),
-                "provider": response.get("provider"),
-            },
-        )
+        persist_result(event.get("request_id"), response)
+
     finally:
         REQUEST_COUNT.labels(service="workflow-engine").inc()
         REQUEST_LATENCY.labels(service="workflow-engine").observe(
