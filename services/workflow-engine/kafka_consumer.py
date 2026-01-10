@@ -40,6 +40,7 @@ def persist_result(request_id: str | None, response: dict) -> None:
         extra={"request_id": request_id, "provider": response.get("provider")},
     )
 
+    
 def process_message(event: dict):
     """
     Core async workflow processor.
