@@ -102,7 +102,10 @@ def send_to_dlq(event: dict):
     """
     Dead Letter Queue handler.
     """
-    logger.critical(f"Sending event to DLQ: {json.dumps(event)}")
+    logger.critical(
+        "Sending event to DLQ",
+        extra={"request_id": event.get("request_id"), "event": event},
+    )
     # In production: publish to Kafka DLQ topic
 
 
