@@ -12,6 +12,7 @@ app = FastAPI(title="AI Platform API Gateway")
 logger = logging.getLogger(__name__)
 
 API_KEY_ENV_VAR = "AI_PLATFORM_API_KEY"
+API_KEY_HEADER = "X-API-Key"
 DEFAULT_KAFKA_TOPIC = "ai-chat-requests"
 
 
@@ -64,7 +65,10 @@ def verify_api_key(x_api_key: str | None) -> None:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
+async def chat(
+    req: ChatRequest,
+    x_api_key: str | None = Header(default=None, alias=API_KEY_HEADER),
+):
     start_time = perf_counter()
     try:
         verify_api_key(x_api_key)
