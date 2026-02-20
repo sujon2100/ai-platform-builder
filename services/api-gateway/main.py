@@ -6,7 +6,7 @@ import uuid
 import os
 import logging
 
-from observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
+from services.observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
 
 app = FastAPI(title="AI Platform API Gateway")
 logger = logging.getLogger(__name__)
