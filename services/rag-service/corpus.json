@@ -1,0 +1,27 @@
+[
+  {
+    "doc_id": "shared-1",
+    "tenant_id": "shared",
+    "content": "The AI Platform API Gateway accepts chat requests over HTTP and authenticates them with an API key header."
+  },
+  {
+    "doc_id": "shared-2",
+    "tenant_id": "shared",
+    "content": "Chat requests are published to a Kafka-compatible topic and processed asynchronously by the workflow engine."
+  },
+  {
+    "doc_id": "shared-3",
+    "tenant_id": "shared",
+    "content": "The workflow engine retries failed processing with exponential backoff before routing poison messages to a dead letter queue."
+  },
+  {
+    "doc_id": "shared-4",
+    "tenant_id": "shared",
+    "content": "The LLM orchestrator generates responses using a self-hosted Ollama model and opens a circuit breaker after repeated failures."
+  },
+  {
+    "doc_id": "demo-tenant-1",
+    "tenant_id": "demo-tenant",
+    "content": "The demo tenant is used for synthetic health-check and monitoring traffic during the evaluation period."
+  }
+]
