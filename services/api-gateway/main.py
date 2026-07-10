@@ -127,13 +127,17 @@ async def get_chat_result(request_id: str, x_api_key: str | None = Header(defaul
     return result
 
 
-@app.get("/health/live")
+@app.api_route("/health/live", methods=["GET", "HEAD"])
 async def health_live():
-    """Liveness check: process is up, no dependency checks."""
+    """Liveness check: process is up, no dependency checks.
+
+    HEAD is registered alongside GET because most uptime monitors probe
+    with HEAD by default, and FastAPI won't add it automatically here.
+    """
     return {"status": "ok"}
 
 
-@app.get("/health/ready")
+@app.api_route("/health/ready", methods=["GET", "HEAD"])
 async def health_ready():
     """Readiness check: can this instance actually reach its dependencies."""
     checks = {}
