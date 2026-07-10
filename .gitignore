@@ -1,0 +1,6 @@
+.env
+.prod_api_key_DO_NOT_COMMIT.txt
+__pycache__/
+*.pyc
+*.db
+.DS_Store
