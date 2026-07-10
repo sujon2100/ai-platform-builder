@@ -1,0 +1,91 @@
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=768M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ollama-init
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["sh", "-c", "until ollama list >/dev/null 2>&1; do sleep 2; done; ollama pull ${OLLAMA_MODEL:-qwen2.5:0.5b}"]
+    restart: "no"
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    container_name: api-gateway
+    environment:
+      - AI_PLATFORM_API_KEY=${AI_PLATFORM_API_KEY:-changeme-devkey}
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - CHAT_TOPIC=ai-chat-requests
+      - RESULTS_DB_PATH=/data/results.db
+    volumes:
+      - shared_data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  workflow-engine:
+    build:
+      context: .
+      dockerfile: services/workflow-engine/Dockerfile
+    container_name: workflow-engine
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:9092
+      - CHAT_TOPIC=ai-chat-requests
+      - DLQ_TOPIC=ai-chat-dlq
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:0.5b}
+      - RESULTS_DB_PATH=/data/results.db
+    volumes:
+      - shared_data:/data
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api-gateway
+
+volumes:
+  ollama_data:
+  shared_data:
