@@ -95,8 +95,12 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
         db.create_pending(request_id, req.tenant_id)
 
         try:
-            get_producer().send(CHAT_TOPIC, value=event)
-            get_producer().flush(timeout=5)
+            # flush() alone isn't enough here - it waits for the batch to
+            # resolve, not to succeed. A failed send still resolves, so we'd
+            # report "accepted" on a message that never reached the broker.
+            # .get() on the future actually raises when the send fails.
+            future = get_producer().send(CHAT_TOPIC, value=event)
+            future.get(timeout=5)
         except KafkaError as exc:
             db.update_result(request_id, "failed", None, None, f"publish failed: {exc}")
             raise HTTPException(status_code=503, detail="Unable to accept request, try again")
