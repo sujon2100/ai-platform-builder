@@ -1,9 +1,8 @@
-import time
-import json
 import logging
+import time
 from time import perf_counter
 
-from observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
+from .observability.metrics import REQUEST_COUNT, REQUEST_LATENCY, LLM_ERRORS
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
@@ -12,54 +11,48 @@ MAX_BACKOFF_SECONDS = 30
 logger = logging.getLogger(__name__)
 
 
-def retrieve_context(message: str, tenant_id: str) -> list[dict]:
+def process_message(event: dict, router, retrieve_context_fn, save_result_fn) -> None:
     """
-    Fetch context from the RAG service (placeholder).
-    """
-    logger.info(
-        "Retrieving context",
-        extra={"tenant_id": tenant_id, "message_length": len(message or "")},
-    )
-    return []
-
-
-def generate_response(message: str, context: list[dict]) -> dict:
-    """
-    Invoke the LLM orchestrator (placeholder).
-    """
-    logger.info("Invoking LLM", extra={"context_size": len(context)})
-    return {"provider": "openai", "response": "placeholder"}
-
-
-def persist_result(request_id: str | None, response: dict) -> None:
-    """
-    Persist LLM response output (placeholder).
-    """
-    logger.info(
-        "Persisting result",
-        extra={"request_id": request_id, "provider": response.get("provider")},
-    )
-
-def process_message(event: dict):
-    """
-    Core async workflow processor.
+    Core async workflow processor: enrich with RAG, invoke the LLM
+    orchestrator, persist the result.
     """
     tenant_id = event.get("tenant_id")
     message = event.get("message")
+    request_id = event.get("request_id")
     if not tenant_id or not message:
         raise ValueError("event must include tenant_id and message")
-    logger.info("Processing event", extra={"request_id": event.get("request_id")})
+
+    logger.info("Processing event", extra={"request_id": request_id})
 
     start_time = perf_counter()
     try:
-        # 1. Enrich with RAG
-        retrieved = retrieve_context(message, tenant_id)
+        retrieved = retrieve_context_fn(message, tenant_id)
 
-        # 2. Invoke LLM
-        response = generate_response(message, retrieved)
+        prompt = message
+        if retrieved:
+            context_text = "\n".join(doc["content"] for doc in retrieved)
+            prompt = f"Context:\n{context_text}\n\nQuestion: {message}"
 
-        # 3. Persist result (placeholder)
-        persist_result(event.get("request_id"), response)
+        result = router.generate(prompt, {"tenant_id": tenant_id})
+
+        if result["status"] != "ok":
+            LLM_ERRORS.labels(provider=result["provider"]).inc()
+
+        save_result_fn(
+            request_id=request_id,
+            status="completed" if result["status"] == "ok" else "failed",
+            provider=result["provider"],
+            response=result.get("response"),
+            error=result.get("error"),
+        )
+
+        logger.info(
+            "Persisted result",
+            extra={"request_id": request_id, "provider": result.get("provider"), "status": result["status"]},
+        )
+
+        if result["status"] != "ok":
+            raise RuntimeError(f"LLM generation failed: {result.get('error') or result['status']}")
     finally:
         REQUEST_COUNT.labels(service="workflow-engine").inc()
         REQUEST_LATENCY.labels(service="workflow-engine").observe(
@@ -67,14 +60,14 @@ def process_message(event: dict):
         )
 
 
-def handle_event(event: dict):
+def handle_event(event: dict, router, retrieve_context_fn, save_result_fn, dlq_producer=None, dlq_topic: str = "ai-chat-dlq") -> None:
     retries = event.get("retries", 0)
 
     try:
-        process_message(event)
-        logger.info("Event processed successfully")
+        process_message(event, router, retrieve_context_fn, save_result_fn)
+        logger.info("Event processed successfully", extra={"request_id": event.get("request_id")})
 
-    except Exception as e:
+    except Exception:
         logger.error(
             "Processing failed",
             extra={"request_id": event.get("request_id")},
@@ -83,34 +76,36 @@ def handle_event(event: dict):
 
         if retries < MAX_RETRIES:
             event["retries"] = retries + 1
-            time.sleep(calculate_backoff(retries))
-
+            backoff = calculate_backoff(retries)
             logger.info(
                 "Retrying event",
                 extra={
                     "request_id": event.get("request_id"),
                     "attempt": event["retries"],
-                    "backoff_seconds": calculate_backoff(retries),
+                    "backoff_seconds": backoff,
                 },
             )
-            handle_event(event)
+            time.sleep(backoff)
+            handle_event(event, router, retrieve_context_fn, save_result_fn, dlq_producer, dlq_topic)
         else:
-            send_to_dlq(event)
+            send_to_dlq(event, dlq_producer, dlq_topic)
 
 
-def send_to_dlq(event: dict):
-    """
-    Dead Letter Queue handler.
-    """
+def send_to_dlq(event: dict, dlq_producer, dlq_topic: str) -> None:
     logger.critical(
         "Sending event to DLQ",
         extra={"request_id": event.get("request_id"), "event": event},
     )
-    # In production: publish to Kafka DLQ topic
+    if dlq_producer is not None:
+        try:
+            dlq_producer.send(dlq_topic, value=event).get(timeout=5)
+        except Exception:
+            logger.critical(
+                "DLQ publish itself failed - event is now unrecorded",
+                extra={"request_id": event.get("request_id")},
+                exc_info=True,
+            )
 
 
 def calculate_backoff(retries: int) -> int:
-    """
-    Calculate exponential backoff for retry attempts with a hard cap.
-    """
     return min(MAX_BACKOFF_SECONDS, RETRY_BACKOFF_SECONDS ** retries)
