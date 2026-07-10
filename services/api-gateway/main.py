@@ -1,18 +1,44 @@
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel, validator
-from time import perf_counter
-from datetime import datetime, timezone
-import uuid
-import os
+import json
 import logging
+import os
+import uuid
+from datetime import datetime, timezone
+from time import perf_counter
 
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import Response
+from kafka import KafkaProducer
+from kafka.errors import KafkaError
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, validator
+
+import db
 from observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
 
 app = FastAPI(title="AI Platform API Gateway")
 logger = logging.getLogger(__name__)
 
 API_KEY_ENV_VAR = "AI_PLATFORM_API_KEY"
-DEFAULT_KAFKA_TOPIC = "ai-chat-requests"
+CHAT_TOPIC = os.getenv("CHAT_TOPIC", "ai-chat-requests")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+
+_producer: KafkaProducer | None = None
+
+
+def get_producer() -> KafkaProducer:
+    global _producer
+    if _producer is None:
+        _producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+            request_timeout_ms=5000,
+        )
+    return _producer
+
+
+@app.on_event("startup")
+def on_startup():
+    db.init_db()
 
 
 class ChatRequest(BaseModel):
@@ -25,6 +51,7 @@ class ChatRequest(BaseModel):
         if not value.strip():
             raise ValueError("must not be empty")
         return value
+
 
 class ChatResponse(BaseModel):
     request_id: str
@@ -40,12 +67,6 @@ def build_chat_event(req: ChatRequest, request_id: str) -> dict:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "event_type": "chat.requested",
     }
-
-
-def publish_event(event: dict, topic: str = DEFAULT_KAFKA_TOPIC) -> None:
-    """Publish the event to Kafka (placeholder implementation)."""
-    # TODO: replace with Kafka producer publish.
-    logger.info("Published chat event", extra={"topic": topic, "event": event})
 
 
 def verify_api_key(x_api_key: str | None) -> None:
@@ -70,26 +91,69 @@ async def chat(req: ChatRequest, x_api_key: str | None = Header(default=None)):
         verify_api_key(x_api_key)
         request_id = str(uuid.uuid4())
 
-        # In production:
-        # 1. Authenticate request
-        # 2. Publish event to Kafka
-        # 3. Return async acknowledgement
-
         event = build_chat_event(req, request_id)
-        publish_event(event)
+        db.create_pending(request_id, req.tenant_id)
 
-        # Emit an audit log to correlate the async workflow with request metadata.
+        try:
+            get_producer().send(CHAT_TOPIC, value=event)
+            get_producer().flush(timeout=5)
+        except KafkaError as exc:
+            db.update_result(request_id, "failed", None, None, f"publish failed: {exc}")
+            raise HTTPException(status_code=503, detail="Unable to accept request, try again")
+
         logger.info(
             "Accepted chat request",
             extra={"tenant_id": req.tenant_id, "request_id": request_id},
         )
 
-        return ChatResponse(
-            request_id=request_id,
-            status="accepted"
-        )
+        return ChatResponse(request_id=request_id, status="accepted")
     finally:
         REQUEST_COUNT.labels(service="api-gateway").inc()
         REQUEST_LATENCY.labels(service="api-gateway").observe(
             perf_counter() - start_time
         )
+
+
+@app.get("/chat/{request_id}")
+async def get_chat_result(request_id: str, x_api_key: str | None = Header(default=None)):
+    verify_api_key(x_api_key)
+    result = db.get_result(request_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="request_id not found")
+    return result
+
+
+@app.get("/health/live")
+async def health_live():
+    """Liveness check: process is up, no dependency checks."""
+    return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Readiness check: can this instance actually reach its dependencies."""
+    checks = {}
+    try:
+        get_producer().bootstrap_connected()
+        checks["kafka"] = "ok"
+    except Exception as exc:
+        checks["kafka"] = f"error: {exc}"
+
+    try:
+        db.init_db()
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"error: {exc}"
+
+    healthy = all(v == "ok" for v in checks.values())
+    status_code = 200 if healthy else 503
+    return Response(
+        content=json.dumps({"status": "ok" if healthy else "degraded", "checks": checks}),
+        media_type="application/json",
+        status_code=status_code,
+    )
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
