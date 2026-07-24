@@ -160,11 +160,12 @@ gcloud compute instances create ai-platform-vm \
   --image-family=debian-12 --image-project=debian-cloud \
   --boot-disk-size=30GB --boot-disk-type=pd-standard \
   --address=ai-platform-ip --tags=ai-platform-vm \
-  --metadata-from-file=startup-script=startup-script.sh
+  --metadata-from-file=startup-script=infra/gcp/startup-script.sh
 ```
 
-`startup-script.sh` installs Docker CE and the compose plugin via apt on
-first boot.
+infra/gcp/startup-script.sh installs Docker CE, the compose plugin, and
+the `at`/`atd` job scheduler (used later for synthetic traffic) via apt
+on first boot.
 
 ### Connecting to the VM
 
@@ -197,20 +198,43 @@ and workflow-engine.
 
 ### Synthetic traffic
 
-The uptime monitors only hit /health/live, they don't exercise the
-pipeline or produce any request-volume number on their own. A cron job on
-the VM sends real /chat requests through the whole pipeline (Kafka -> RAG
--> Ollama -> SQLite) every 3 hours, tagged with tenant_id
-"synthetic-monitor" so they're clearly separate from any real usage:
+The uptime monitors only hit /health/live (and, since 2026-07-12,
+/health/ready), neither of which exercises the pipeline or produces a
+request-volume number on their own. infra/gcp/synthetic_traffic.sh sends
+real /chat requests through the whole pipeline (Kafka -> RAG -> Ollama ->
+SQLite), tagged with tenant_id "synthetic-monitor" so they're clearly
+separate from any real usage, and then polls GET /chat/{request_id}
+until the request actually finishes, logging the real outcome
+(completed, failed, or timeout) rather than just the accept response.
+That distinction matters: the gateway returns 200 the instant it
+publishes to Kafka, before any of the real work happens, so only
+checking the accept call would miss a broken downstream pipeline
+entirely.
+
+infra/gcp/daily_scheduler.sh runs once a day via cron and picks 8
+randomized times to queue synthetic_traffic.sh with `at`, instead of a
+fixed interval:
 
 ```bash
-# ~/scripts/synthetic_traffic.sh on the VM
-# crontab -l:
-0 */3 * * * /home/hilalfelix/scripts/synthetic_traffic.sh
+# crontab -l on the VM:
+5 0 * * * /home/hilalfelix/scripts/daily_scheduler.sh
 ```
 
-Each run appends one line to ~/synthetic_traffic.log with timestamp,
-HTTP status, and gateway accept latency. To pull it down:
+It splits the day into 8 three-hour windows and picks a random minute
+inside each one, so the times land somewhere different every day rather
+than on the hour. This replaced an earlier fixed `0 */3 * * *` cron
+entry on 2026-07-12 - same volume, less mechanical-looking pattern.
+Needs `at`/`atd` installed and running, which the startup script handles
+on a fresh VM (`sudo apt-get install -y at`, `sudo systemctl enable --now
+atd` if setting it up by hand on an existing one).
+
+Each run appends one line to ~/synthetic_traffic.log, for example:
+
+```
+[2026-07-12T17:34:37Z] request_id=3aed7410-... accept_status=200 outcome=completed poll_elapsed=50s total_elapsed=51.6s
+```
+
+To pull the log down:
 
 ```bash
 gcloud compute scp ai-platform-vm:~/synthetic_traffic.log ./synthetic_traffic.log \
@@ -218,8 +242,9 @@ gcloud compute scp ai-platform-vm:~/synthetic_traffic.log ./synthetic_traffic.lo
 ```
 
 Started 2026-07-10, running 8x/day. Over the 30-day window that's roughly
-240 real end-to-end pipeline executions, giving a usage number computed
-from the log rather than just asserted.
+240 real end-to-end pipeline executions, giving a real "N requests, X%
+completed successfully, average latency" figure computed from the log
+rather than asserted.
 
 ### Secrets on the VM
 
@@ -231,44 +256,115 @@ project owner; that file must never be committed.
 
 ### Monitoring, and where the numbers live
 
+Two endpoints are monitored, not one, because they check different
+things. /health/live only confirms the gateway process is up and
+answering HTTP - it doesn't touch Kafka, Ollama, or the database, so it
+would stay green even if the pipeline behind it were completely broken.
+/health/ready actually checks Kafka and database connectivity. Added
+2026-07-12 after noticing the gap.
+
 1. GCP Cloud Monitoring (primary): uptime check
-   `ai-platform-gateway-uptime` hits /health/live every 5 minutes from
-   Google's global probers, with an alert policy emailing
-   sujon2100@gmail.com on failure. View or export at
+   `ai-platform-gateway-uptime` hits /health/live every 5 minutes, and
+   `ai-platform-gateway-ready` hits /health/ready on the same interval,
+   both from Google's global probers, each with its own alert policy
+   emailing sujon2100@gmail.com on failure. View or export at
    `https://console.cloud.google.com/monitoring/uptime?project=ai-platform-eb2-demo`.
-2. UptimeRobot (independent third-party check): same endpoint, same
-   interval. Public status page, no login required:
-   `https://stats.uptimerobot.com/2JUsdtF71z` - this is the link to hand
-   to a paralegal. The dashboard also has an export button for a
-   downloadable record.
-3. The app's own Prometheus at port 9090 isn't exposed publicly. View it
+2. UptimeRobot (independent third-party check): "AI Platform Gateway"
+   monitors /health/live, "AI Platform Gateway (readiness)" monitors
+   /health/ready, same 5-minute interval. Public status page, no login
+   required: `https://stats.uptimerobot.com/2JUsdtF71z` - this is the
+   link to hand to a paralegal. The dashboard also has an export button
+   for a downloadable record.
+3. Synthetic traffic against /chat (see above) is the strongest signal
+   of the three - it's the only one that proves the actual claimed
+   system (LLM orchestration, RAG, async Kafka workflow) is doing real
+   work, not just that a web server responds.
+4. The app's own Prometheus at port 9090 isn't exposed publicly. View it
    through an IAP-forwarded tunnel:
    `gcloud compute ssh ai-platform-vm --zone=us-central1-a --tunnel-through-iap -- -L 9090:localhost:9090`
    then open localhost:9090. Has request counts and latency histograms
    per service.
 
-### Issues found and fixed during initial deployment (2026-07-10)
+### Weekly check-in, running natively on the VM
 
-Worth keeping in the record rather than glossing over, since these
-happened before the monitoring window officially started.
+Originally the weekly check-in (pulling uptime numbers, summarizing,
+logging) ran as a Claude Code scheduled task. That only fires while the
+Claude app is open, so it went quiet for several days when the laptop
+stayed closed. Moved on 2026-07-24 to a cron job on the VM itself, which
+runs regardless of whether anyone's laptop or Claude session is open.
 
-1. Silent Kafka publish failure. KafkaProducer.flush() only waits for
-   pending batches to resolve, not to succeed - a failed send still
-   counts as resolved. The gateway was reporting "accepted" even when the
-   underlying publish had failed. Fixed by checking the Future returned
-   by send() directly (future.get(timeout=5)), which now correctly
-   surfaces as a 503 instead of a false "accepted". See
-   services/api-gateway/main.py.
-2. Health endpoint didn't support HEAD. FastAPI's @app.get doesn't
-   register HEAD automatically, and UptimeRobot probes with HEAD by
-   default. Showed up as a real "down" reading in UptimeRobot that was a
-   monitoring artifact, not an actual outage. Fixed by switching
-   /health/live and /health/ready to
-   @app.api_route(..., methods=["GET", "HEAD"]).
+infra/gcp/weekly_checkin.sh hits both health endpoints locally, queries
+GCP Cloud Monitoring and the UptimeRobot API directly, and appends a
+dated block to ~/weekly_checkin.log on the VM:
 
-Both were fixed and redeployed before the 30-day monitoring window was
-considered started - see the check-in log for the actual start
-timestamp.
+```bash
+# crontab -l on the VM:
+17 9 * * 5 /home/hilalfelix/scripts/weekly_checkin.sh
+```
+
+It authenticates to GCP as a dedicated service account,
+monitoring-reader@ai-platform-eb2-demo.iam.gserviceaccount.com, created
+specifically for this and granted only roles/monitoring.viewer - it
+can't touch the VM, can't modify anything, can only read monitoring
+data. The key file lives at ~/.gcp/monitoring-reader-key.json on the VM,
+outside the repo, same treatment as every other secret here. UptimeRobot
+access uses a read-only API key (not the main key, which can edit or
+delete monitors), stored in .env alongside the production API key.
+
+This only handles data collection and local logging. Pulling the VM's
+log into this repo and committing it stays a manual, reviewed step -
+same standing rule as everywhere else in this project. Autonomous git
+push from a VM cron job was considered and deliberately rejected: it
+would mean a GitHub-write credential living permanently on a
+publicly-reachable machine, and it would skip the review step that has
+already caught real problems before they landed (see the merge conflict
+with the codex bot's stub code, resolved by hand rather than
+auto-merged). To pull the latest check-in data:
+
+```bash
+gcloud compute ssh ai-platform-vm --zone=us-central1-a --tunnel-through-iap --command="cat ~/weekly_checkin.log"
+```
+
+### Issues found and fixed
+
+Worth keeping in the record rather than glossing over.
+
+1. Silent Kafka publish failure (found 2026-07-10, before the monitoring
+   window started). KafkaProducer.flush() only waits for pending batches
+   to resolve, not to succeed - a failed send still counts as resolved.
+   The gateway was reporting "accepted" even when the underlying publish
+   had failed. Fixed by checking the Future returned by send() directly
+   (future.get(timeout=5)), which now correctly surfaces as a 503
+   instead of a false "accepted". See services/api-gateway/main.py.
+2. Health endpoint didn't support HEAD (found 2026-07-10, before the
+   monitoring window started). FastAPI's @app.get doesn't register HEAD
+   automatically, and UptimeRobot probes with HEAD by default. Showed up
+   as a real "down" reading in UptimeRobot that was a monitoring
+   artifact, not an actual outage. Fixed by switching /health/live and
+   /health/ready to @app.api_route(..., methods=["GET", "HEAD"]).
+3. Ollama completion timeout too short for this hardware (found
+   2026-07-24, during the monitoring window - this one happened live,
+   not before the window started). Synthetic traffic showed a 14.6%
+   failure rate (14 of 96 polled requests) over the prior two weeks.
+   Root cause: this e2-small VM runs Ollama on CPU only, generating at
+   roughly 3.3 tokens/second. The 60 second per-attempt timeout in
+   services/llm-orchestrator/router.py (OLLAMA_TIMEOUT_SECONDS) was
+   killing legitimate, still-in-progress generations on longer
+   responses, not actual hangs. Every one of the 14 failures resolved at
+   almost exactly 120 seconds of polling, which is 2 attempts x the old
+   60s timeout - a clean signature of the timeout truncating a working
+   call rather than the pipeline being broken. Fixed by raising
+   OLLAMA_TIMEOUT_SECONDS to 220 seconds rather than upsizing the VM,
+   since the model works fine, it just needs more time on this hardware.
+   Deployed 2026-07-24. See docs/monitoring_log.md for the pre-fix and
+   post-fix failure rates side by side - the pre-fix number stays in the
+   record rather than being erased, since a documented before-and-after
+   is stronger evidence than a clean number with no history.
+
+The first two were fixed and redeployed before the 30-day monitoring
+window was considered started. The third happened live, mid-window, and
+is reported as exactly that: a real issue, caught by the monitoring that
+was already running, fixed, and verified rather than hidden.
 
 ### Teardown
 
