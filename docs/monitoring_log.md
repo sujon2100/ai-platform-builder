@@ -136,34 +136,54 @@ what's in the log, but n=5 is too small to call it confirmed rather than just
 plausible - could equally be a genuine regression. Not calling this fixed yet.
 Next week's check-in should have a much larger post-fix sample to tell real
 signal from restart noise, and the poller's timeout likely needs raising past
-440s if the retry-window theory holds.2026-07-24 (automated check-in): first run of the lighter check-in process now that
-the weekly data collection lives on the VM's own cron (~/scripts/weekly_checkin.sh,
-Fridays 09:17 local VM time) instead of depending on this session being open. The
-cron fired as expected this morning (log entry at 16:04:40 UTC), so that move is
-confirmed working.
-
-Uptime since window start (2026-07-10 08:10 UTC): GCP Cloud Monitoring shows
-99.996% on /health/live and 99.995% on /health/ready. UptimeRobot's trailing
-windows show Liveness at 100.000% (1d) / 100.000% (7d) / 99.965% (30d) and
-Readiness at 100.000% across all three - the 30-day Liveness dip is the same
-pre-window HTTP 405 incident already documented above, nothing new.
-
-Also made a fix today to the thing flagged in the last entry: raised
-OLLAMA_TIMEOUT_SECONDS from 60 to 220 in the orchestrator, redeployed at
-15:52:45 UTC (workflow-engine container restart). Before the fix, the 96 polled
-synthetic runs since 07-12 stood at 14 failed = 14.6% failure, all attributed to
-generations running past the old 60s timeout. After the restart, only 5 synthetic
-requests have run so far (small sample, first ~25 minutes post-deploy): 1
-completed, 4 came back as outcome=timeout - worse than before, not better. Dug
-into why: the synthetic traffic poller's own wait ceiling (POLL_TIMEOUT_SECONDS
-in infra/gcp/synthetic_traffic.sh) was also raised today, from 120s to 300s -
-enough to cover one attempt at the new 220s Ollama timeout with some margin, but
-not two. The orchestrator retries a failed attempt once (MAX_ATTEMPTS=2 in
-router.py), so a request that needs a retry could legitimately take up to ~440s
-end to end - longer than the poller now waits, meaning a request that would
-eventually succeed could still get logged as outcome=timeout. That lines up with
-what's in the log, but n=5 is too small to call it confirmed rather than just
-plausible - could equally be a genuine regression. Not calling this fixed yet.
-Next week's check-in should have a much larger post-fix sample to tell real
-signal from restart noise, and the poller's timeout likely needs raising past
 440s if the retry-window theory holds.
+
+(Note: the automated check-in above ran twice in close succession and the
+duplicate block that resulted has been removed for clarity - both runs found
+the same thing, so nothing is lost.)
+
+2026-07-24 (follow-up, same day): the automated check-in above flagged a real
+open question - whether the "worse than before" post-restart numbers were a
+genuine regression or just the test poller's own timeout being too short - and
+correctly declined to change any code itself while evidence collection is
+live. Ran that down properly. Fixed the poller: raised
+POLL_TIMEOUT_SECONDS in infra/gcp/synthetic_traffic.sh from 300s to 480s,
+comfortably above the theoretical 440s worst case (MAX_ATTEMPTS=2 x the new
+220s Ollama timeout), and redeployed it to the VM.
+
+Then went back and checked the actual final status of every request the old,
+too-short poller had mislabeled "timeout" by querying the database directly
+(GET /chat/{request_id}) rather than trusting the poller's own read. Of 11
+requests logged as outcome=timeout in the post-fix batch, all 11 had in fact
+completed successfully - the poller gave up watching before the pipeline
+finished, not because anything was broken. Combined with the 1 request the
+poller had correctly logged as completed immediately, the full post-fix
+validation batch (12 requests, deliberately including several of the prompts
+that triggered the pre-fix failures) came out to 12/12 completed, 0 failed.
+
+Before/after, side by side, both numbers kept rather than only reporting the
+clean one: pre-fix, 14 of 96 polled requests failed to complete (14.6%),
+every one attributable to the 60s per-attempt timeout truncating a
+generation that was still legitimately running. Post-fix, 0 of 12 failed
+(0%), with some individual requests taking as long as 6-7 minutes end to end
+when a first attempt used the full 220s before a successful retry. Sample
+size post-fix is modest (n=12, gathered deliberately over roughly an hour
+rather than waiting for natural daily volume) - the ongoing 8x/day synthetic
+traffic will build a larger post-fix sample over the coming weeks, and that
+is the number that should anchor the final petition writeup, not this
+initial validation batch alone.
+
+One new, separate issue surfaced while validating this, worth recording
+rather than quietly fixing: `rpk group describe workflow-engine` reported
+the consumer group as `Empty` with 0 members and a stuck lag count, while
+the container logs showed it continuously and correctly processing and
+persisting results the entire time (confirmed by checking results directly
+against the database). This points to Kafka offset commits failing
+intermittently, most likely because a single message can legitimately take
+several minutes to process on this hardware, which is long enough to strain
+the consumer group's session/heartbeat mechanics. Data integrity is not
+currently affected - nothing has been lost, every checked result was
+correct - but if the process restarted while offsets are in this state, it
+could needlessly reprocess a small number of already-completed messages.
+Not fixed as part of this change; it needs its own investigation rather
+than a rushed patch on top of today's other changes.

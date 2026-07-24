@@ -356,15 +356,41 @@ Worth keeping in the record rather than glossing over.
    call rather than the pipeline being broken. Fixed by raising
    OLLAMA_TIMEOUT_SECONDS to 220 seconds rather than upsizing the VM,
    since the model works fine, it just needs more time on this hardware.
-   Deployed 2026-07-24. See docs/monitoring_log.md for the pre-fix and
-   post-fix failure rates side by side - the pre-fix number stays in the
-   record rather than being erased, since a documented before-and-after
-   is stronger evidence than a clean number with no history.
+   Deployed 2026-07-24. Verified with a 12-request post-fix batch: 12/12
+   completed, 0 failed, versus 14/96 (14.6%) failed before the fix. Some
+   individual requests still took up to 6-7 minutes end to end when a
+   first attempt used the full 220s before a successful retry - that's
+   expected on CPU-only inference at this VM size, not a new problem.
+   See docs/monitoring_log.md for the full before-and-after writeup -
+   the pre-fix number stays in the record rather than being erased,
+   since a documented before-and-after is stronger evidence than a
+   clean number with no history.
+4. Fixing #3 exposed that the synthetic traffic poller's own wait
+   ceiling (POLL_TIMEOUT_SECONDS in infra/gcp/synthetic_traffic.sh) was
+   too short to observe the new worst case: MAX_ATTEMPTS=2 x the new
+   220s timeout is up to 440s, longer than the poller's 300s window at
+   the time. This caused genuinely successful requests to be logged as
+   outcome=timeout - a false negative in the test harness, not a real
+   failure. Confirmed by checking the database directly: every request
+   the poller had logged as "timeout" had actually completed. Fixed by
+   raising POLL_TIMEOUT_SECONDS to 480s. Deployed 2026-07-24.
 
-The first two were fixed and redeployed before the 30-day monitoring
-window was considered started. The third happened live, mid-window, and
-is reported as exactly that: a real issue, caught by the monitoring that
-was already running, fixed, and verified rather than hidden.
+The first two issues were fixed and redeployed before the 30-day
+monitoring window was considered started. The third and fourth happened
+live, mid-window, and are reported as exactly that: real issues, caught
+by the monitoring that was already running, fixed, and verified rather
+than hidden.
+
+A fifth, separate issue was found while validating #3 and #4 but not
+fixed as part of this change: `rpk group describe workflow-engine`
+showed the consumer group as Empty with 0 members and a stuck lag
+count, while the container logs showed continuous, correct processing
+the whole time. Likely intermittent Kafka offset-commit failures,
+plausibly related to how long a single message can take to process on
+this hardware straining the consumer's session/heartbeat mechanics.
+Data integrity was not affected - every result checked against the
+database was correct - but it needs its own investigation rather than a
+rushed patch alongside today's other changes.
 
 ### Teardown
 
