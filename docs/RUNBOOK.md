@@ -381,16 +381,50 @@ live, mid-window, and are reported as exactly that: real issues, caught
 by the monitoring that was already running, fixed, and verified rather
 than hidden.
 
-A fifth, separate issue was found while validating #3 and #4 but not
-fixed as part of this change: `rpk group describe workflow-engine`
-showed the consumer group as Empty with 0 members and a stuck lag
-count, while the container logs showed continuous, correct processing
-the whole time. Likely intermittent Kafka offset-commit failures,
-plausibly related to how long a single message can take to process on
-this hardware straining the consumer's session/heartbeat mechanics.
-Data integrity was not affected - every result checked against the
-database was correct - but it needs its own investigation rather than a
-rushed patch alongside today's other changes.
+5. Consumer group instability under CPU pressure, causing redundant
+   reprocessing of already-completed messages (found 2026-07-24 while
+   validating #3 and #4, root-caused and fixed later the same day after
+   a second, separate incident made clear it wasn't a one-off). Two
+   uptime incidents on 2026-07-24 - 19:04-19:16 UTC and 22:44-22:51 UTC,
+   same signature both times - had /health/live and /health/ready fail
+   together, which pointed at something affecting the whole VM rather
+   than a single dependency, since /health/live has no dependency checks
+   at all. Root cause: this e2-small instance has 2 vCPUs and no
+   per-container CPU limit on Ollama. A single generation - longer now
+   that OLLAMA_TIMEOUT_SECONDS is 220 rather than 60 - can consume the
+   entire machine's CPU, starving Docker's own DNS resolution (confirmed
+   in the systemd journal: `DNS lookup failed for redpanda:9092` during
+   both incident windows), redpanda's client connections, and the
+   gateway's ability to answer health checks in time. The same CPU
+   starvation was also causing the workflow-engine's Kafka consumer to
+   miss heartbeats and get dropped from its consumer group; because
+   Kafka's automatic offset commits were failing for the same reason,
+   the consumer would rejoin from a stale offset and silently re-process
+   a batch of messages that had already completed hours earlier -
+   confirmed directly: of 14 distinct requests completing in one
+   20-minute window, 13 were reprocessed duplicates of an earlier
+   validation batch, with only 1 genuinely new request sent in that
+   window. Fixed with two changes: capped the ollama container to 1.0 of
+   the VM's 2 vCPUs (docker-compose.yml, `cpus: "1.0"`), verified via the
+   container's cgroup cpu.stat showing real enforced throttling, not
+   just a configured-but-ignored limit; and switched the Kafka consumer
+   from automatic to manual offset commits with a raised
+   max_poll_interval_ms (services/workflow-engine/worker.py), so the
+   committed offset only advances once a message is actually done
+   regardless of CPU pressure elsewhere, and a legitimately slow retry
+   sequence (worst case around 22 minutes with the 220s timeout) doesn't
+   get mistaken for a dead consumer under the old 5-minute default.
+   Deployed 2026-07-24 23:29 UTC. Verified: consumer group went from
+   Empty/0 members to Stable/1 member, with the committed offset
+   advancing correctly as real work completed. See
+   docs/monitoring_log.md for the full investigation with exact
+   timestamps and log excerpts. Not claimed as a complete fix for the
+   underlying constraint - the VM is still only 2 vCPUs, and the cap
+   trades some Ollama latency for system-wide responsiveness. If the
+   same signature recurs with these changes in place, that points at
+   the 2-vCPU ceiling itself, and upsizing the VM is the next real
+   option - a cost decision for the project owner, not something to do
+   unilaterally mid-window.
 
 ### Teardown
 

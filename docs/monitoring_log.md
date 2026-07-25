@@ -187,3 +187,121 @@ correct - but if the process restarted while offsets are in this state, it
 could needlessly reprocess a small number of already-completed messages.
 Not fixed as part of this change; it needs its own investigation rather
 than a rushed patch on top of today's other changes.
+
+2026-07-24 (incident investigation, same day): two incidents, same
+signature, both /health/live and /health/ready failing together rather than
+just one - 19:04-19:16 UTC (10m13s) and 22:44-22:51 UTC (6m46s), about 3.5
+hours apart. Two occurrences of the same failure mode in one day meant this
+needed an actual root cause, not another "self-resolved, moving on."
+
+Both endpoints failing together points at something affecting the whole VM
+or the whole gateway process, not a single downstream dependency - /health/
+live doesn't check Kafka or the database at all, so whatever took it down
+had to be something more fundamental. Checked dmesg, the systemd journal,
+container logs, and restart history across both windows.
+
+dmesg showed `virtio_balloon: Out of puff! Can't get 1 pages` at 16:14:32,
+during the tail end of the 12-request validation batch from earlier today -
+a real kernel-level memory pressure signal, though not a full OOM kill (no
+oom-killer entries anywhere in the log). Current free memory on this
+e2-small instance sits at 69-90MB out of 1.9GB, with zero swap configured.
+
+The more direct evidence came from the systemd journal around each window
+specifically. Starting at 22:40:02, the workflow-engine's Kafka client began
+hitting repeated `timed out after 30000 ms` errors talking to redpanda,
+recurring every 30-45 seconds. By 22:43:41 this had escalated to actual DNS
+resolution failure - `DNS lookup failed for redpanda:9092, Temporary
+failure in name resolution` - Docker's own internal DNS resolver failing to
+resolve another container on the same bridge network. That doesn't happen
+because a dependency is slow; it happens when the whole VM is too
+CPU-starved for basic OS-level services to get scheduled in time. At
+22:44:18, in the same window, an Ollama generation call independently timed
+out too. Checked whether this was a coincidence by looking at what was
+actually running: an Ollama `llama-server` process had been pegging 90-179%
+CPU continuously since 22:45, the same minute the incident started, and
+GCE's own guest agent plugins independently crashed and restarted at that
+exact same minute (confirmed by checking journalctl for
+google_guest_agent_manager crash-loop frequency across the full day -
+it clusters tightly around 18:42-18:58 and 22:22-22:33, bracketing both
+incident windows). No container had actually restarted the entire time
+(RestartCount=0 on every container, checked via docker inspect) - the
+gateway process never died, it just became too slow to answer a health
+probe within its timeout window while the machine's CPU was saturated.
+
+Root cause: this e2-small instance has 2 vCPUs total and no per-container
+CPU limit on Ollama. A single generation - especially now that
+OLLAMA_TIMEOUT_SECONDS is 220 rather than 60, letting them run considerably
+longer - can consume the entire machine's CPU budget. When that happens,
+Docker's DNS resolver, redpanda's client-facing socket, the guest agent,
+and the gateway's own ability to answer external health checks all compete
+for a CPU that isn't there, and all degrade at once. That is exactly why
+both checks fail together rather than just the one that depends on
+something else.
+
+Checked directly whether this ties back to the 220s timeout change and
+today's heavier validation load, since assuming either way wasn't good
+enough: yes, with direct evidence, not correlation alone. The very first
+memory-pressure signal (16:14:32) landed inside that batch's own window.
+More importantly, digging into why the Kafka consumer group kept losing
+membership during the incidents turned up something worse than expected -
+not just a busy CPU, but an actual feedback loop. Checked how many
+synthetic requests were genuinely sent since 22:00: one. Checked how many
+distinct request IDs the database showed completing in that same window:
+fourteen. Thirteen of those were request IDs from the earlier 12-request
+validation batch that had already completed hours earlier, around
+17:49-18:00 - being silently reprocessed from scratch. The mechanism: when
+Ollama saturates the CPU, the workflow-engine's Kafka heartbeat thread
+can't get scheduled in time and the consumer gets kicked from its group.
+Because offset commits were also failing during that same CPU-starved
+window (kafka-python's enable_auto_commit runs on its own background timer,
+just as vulnerable to CPU starvation as anything else), the consumer
+rejoins from a stale, already-passed offset and re-processes a whole batch
+of already-completed messages - burning real CPU on redundant work, which
+extends the CPU starvation further, making the next heartbeat failure more
+likely. This is the same "Empty group, stuck offset" symptom flagged as an
+open, unresolved finding earlier today; it turned out to be the same root
+cause, now understood precisely rather than just observed.
+
+Separately, kafka-python's default max_poll_interval_ms is 5 minutes. Worst
+case for handling one message now - MAX_RETRIES(3) attempts, each up to
+MAX_ATTEMPTS(2) x OLLAMA_TIMEOUT_SECONDS(220s) = 440s, plus backoff between
+retries - can run to roughly 22 minutes. That alone would make Kafka assume
+the consumer had died and force a rebalance mid-retry, independent of
+actual CPU pressure.
+
+Fixed, not just documented, per the standing instruction that a second
+occurrence of the same shrug isn't good enough:
+
+1. Capped the ollama container to 1.0 of this VM's 2 vCPUs
+   (docker-compose.yml, `cpus: "1.0"`), guaranteeing the other vCPU stays
+   available for Docker's networking, redpanda, and the gateway even during
+   a long generation. Verified the limit is real, not cosmetic: cpu.stat
+   for the container's cgroup shows nr_throttled=1924 out of nr_periods=4969
+   periods (93.26 seconds of enforced throttling) within minutes of
+   deploying it - the kernel is actively enforcing the cap.
+2. Switched the Kafka consumer from automatic to manual offset commits
+   (services/workflow-engine/worker.py: enable_auto_commit=False, explicit
+   consumer.commit() in a finally block after each message is fully
+   handled) so the committed offset only ever advances once work is
+   actually done, regardless of what else is happening on the machine.
+   Also raised max_poll_interval_ms to 1,800,000 (30 minutes) so a
+   legitimately slow retry sequence doesn't get mistaken for a dead
+   consumer.
+
+Deployed 2026-07-24 23:29 UTC (ollama and workflow-engine both recreated).
+Verified over the following several minutes: consumer group state went from
+Empty/0 members to Stable/1 member, the committed offset advanced correctly
+as messages completed (119 to 121, tracking two real completions) instead
+of staying frozen while work piled up behind it, and no heartbeat failures
+or rebalances occurred across multiple full message-processing cycles.
+
+Not claiming this eliminates the underlying constraint: the VM still only
+has 2 vCPUs total, and the CPU cap means Ollama may now take somewhat
+longer per generation under load, trading some latency for the rest of the
+system staying responsive - a fair trade, but a real one. Both fixes
+address the confirmed mechanism directly rather than papering over the
+symptom. If this same signature recurs even with these changes in place,
+that would point to the 2-vCPU ceiling itself being the limit, and
+upsizing the VM (e2-medium, more baseline CPU and double the RAM) would be
+the next real lever - a cost decision for the project owner to make
+explicitly, not something to do unilaterally mid-window.

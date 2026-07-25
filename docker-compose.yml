@@ -23,6 +23,16 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
+    # Capped at 1 of this VM's 2 vCPUs. Without a limit, a single generation
+    # can consume the whole machine (observed at 90-179% CPU during the
+    # 2026-07-24 incidents), starving Docker's own DNS resolution, redpanda's
+    # client connections, and the gateway's ability to answer health checks
+    # in time - which is why both /health/live and /health/ready failed
+    # together rather than just one dependency. This guarantees the other
+    # 1 vCPU stays available for everything else even during a long
+    # generation. See docs/monitoring_log.md 2026-07-24 for the full
+    # investigation.
+    cpus: "1.0"
     volumes:
       - ollama_data:/root/.ollama
     ports:
